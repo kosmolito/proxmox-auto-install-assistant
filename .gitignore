@@ -1,0 +1,6 @@
+private/
+public/
+__pycache__/
+.pytest_cache/
+.remember/
+*testing*

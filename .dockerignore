@@ -1,0 +1,10 @@
+.git
+.github
+.remember
+*compose*.y*ml
+conftest.py
+private
+public
+testing
+tests
+README.md

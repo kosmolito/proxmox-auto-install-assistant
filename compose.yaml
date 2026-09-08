@@ -1,0 +1,24 @@
+services:
+  pve-answer:
+    # Published by CI. Swap :latest for :sha-<short> to pin a known-good build.
+    image: ghcr.io/kosmolito/proxmox-auto-install-assistant:latest
+    container_name: pve-answer
+    restart: unless-stopped
+    ports:
+      # The Proxmox installer fetches from https://<host>/answer, so publish
+      # the container's 8443 on the host's 443.
+      - "443:8443"
+    environment:
+      # Every address the installer may use to reach this server. Required the
+      # first time, when the certificate is generated; ignored afterwards.
+      - PVE_ANSWER_HOSTNAMES=${PVE_ANSWER_HOSTNAMES:-}
+      # Require the bearer token the ISO was prepared with. Comment this out
+      # to serve answer files to anyone who can reach the server.
+      - PVE_ANSWER_TOKEN_FILE=/app/private/token
+      # Uncomment to enable the status page at GET /. It lists the MAC
+      # addresses answer files exist for, so leave it off in normal operation.
+      # - PVE_ANSWER_DEBUG=1
+    volumes:
+      # Writable, so the entrypoint can create whatever is missing on first run.
+      - ./public:/app/public
+      - ./private:/app/private
