@@ -1,36 +1,18 @@
-# Development: build the image from this checkout instead of pulling the
-# published one, with the status page enabled.
+# Builds from this checkout instead of pulling, with the status page on.
+# Runs as pve-answer-dev on 444, so it can sit alongside the published one.
 #
 #   docker compose -f compose.dev.yaml up -d --build
-#
-# Self-contained, so it replaces compose.yaml rather than stacking on it. Kept
-# separate because with both `image:` and `build:` in one file, a host without
-# the image cached builds from its local checkout instead of pulling, and a
-# deployment can silently run unpublished code.
-#
-# Serves on 444 under its own container name, so it can run alongside the
-# published one. Both mount the same ./private, so they share a certificate
-# and token.
 services:
   pve-answer:
     build: .
     container_name: pve-answer-dev
     restart: unless-stopped
     ports:
-      # The Proxmox installer fetches from https://<host>/answer, so publish
-      # the container's 8443 on the host's 444.
       - "444:8443"
     environment:
-      # Every address the installer may use to reach this server. Required the
-      # first time, when the certificate is generated; ignored afterwards.
       - PVE_ANSWER_HOSTNAMES=${PVE_ANSWER_HOSTNAMES:-}
-      # Require the bearer token the ISO was prepared with. Comment this out
-      # to serve answer files to anyone who can reach the server.
       - PVE_ANSWER_TOKEN_FILE=/app/private/token
-      # Uncomment to enable the status page at GET /. It lists the MAC
-      # addresses answer files exist for, so leave it off in normal operation.
       - PVE_ANSWER_DEBUG=1
     volumes:
-      # Writable, so the entrypoint can create whatever is missing on first run.
       - ./public:/app/public
       - ./private:/app/private

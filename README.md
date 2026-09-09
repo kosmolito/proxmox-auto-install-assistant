@@ -3,10 +3,8 @@
 Serves Proxmox VE installers an answer file over HTTPS, picked per machine by
 MAC address.
 
-Two hosts are involved:
-
-- **The answer server** — a VM or box with Docker. Runs this repo.
-- **The Proxmox host** — builds the ISO that points at the answer server.
+Everything happens on **one machine, the answer server** — it serves the answer
+files and prepares the ISO. No Proxmox host is involved until you boot it.
 
 The installer POSTs its hardware info to `/answer`. The server returns
 `public/answers/<mac>.toml` for a matching NIC, or `public/default.toml` if
@@ -17,9 +15,7 @@ gitignored — answer files carry root password hashes and SSH keys.
 
 ---
 
-## On the answer server
-
-### 1. Answer files
+## Answer files
 
 One file per machine, named after the MAC it installs from. Separators don't
 matter: `bc-24-11-7b-51-aa.toml`, `bc:24:11:7b:51:aa.toml` and
@@ -53,7 +49,42 @@ disk-list = ['sda']
 Field reference: [Answer File Format](https://pve.proxmox.com/wiki/Automated_Installation#Answer_File_Format).
 Validate with `proxmox-auto-install-assistant validate-answer <file>`.
 
-### 2. Run
+---
+
+## Setup with Ansible
+
+See [`ansible/`](ansible/). Edit `ansible/hosts` and
+`ansible/group_vars/answer_server.yml`, then:
+
+```bash
+cd ansible
+ansible-playbook answer-server.yaml   # installs everything, starts the server,
+                                      # prints the token and fingerprint
+ansible-playbook prepare-iso.yaml     # downloads the ISO and bakes them in
+```
+
+Idempotent, and equivalent to the manual steps below.
+
+---
+
+## Setup manually
+
+### 1. Install Docker and the assistant
+
+Docker from [its own repository](https://docs.docker.com/engine/install/), then
+the assistant. It is published for Debian suites only, so on Ubuntu install the
+`.deb` directly:
+
+```bash
+V=9.2.8
+curl -fsSLO "http://download.proxmox.com/debian/pve/dists/trixie/pve-no-subscription/binary-amd64/proxmox-auto-install-assistant_${V}_amd64.deb"
+apt install ./proxmox-auto-install-assistant_${V}_amd64.deb
+```
+
+On Debian you can add the `pve-no-subscription` repository and
+`apt install proxmox-auto-install-assistant` instead.
+
+### 2. Start the answer server
 
 On first start the container generates a self-signed certificate, an auth token
 and a `default.toml`. It needs the addresses the installer will use, since the
@@ -74,11 +105,10 @@ entrypoint: certificate SHA-256 fingerprint (pass to prepare-iso --cert-fingerpr
 entrypoint:   AB:CD:EF:...
 ```
 
-Existing files are never overwritten, so `PVE_ANSWER_HOSTNAMES` is only needed
-the first time. Without a certificate and without that variable, the container
-refuses to start.
+Nothing is overwritten, so `PVE_ANSWER_HOSTNAMES` is only needed the first
+time. With no certificate and no such variable, the container refuses to start.
 
-To supply your own instead, drop them in before the first start:
+To supply your own instead, drop them in first:
 
 ```bash
 ./gen-cert.sh 10.100.9.50 pve-answer.example.com   # writes private/tls/
@@ -86,13 +116,7 @@ printf 'provisioning:%s' "$(openssl rand -hex 32)" > private/token
 chmod 600 private/token
 ```
 
-Print the fingerprint again later:
-
-```bash
-openssl x509 -in private/tls/server.crt -noout -fingerprint -sha256 | cut -d '=' -f 2
-```
-
-### 3. Check it
+Check it:
 
 ```bash
 curl --cacert private/tls/server.crt https://10.100.9.50/health
@@ -102,23 +126,13 @@ curl --cacert private/tls/server.crt -X POST https://10.100.9.50/answer \
     -d '{"network_interfaces":[{"mac":"bc:24:11:7b:51:aa"}]}'
 ```
 
-`server.py` lives in the image: `docker compose pull && docker compose up -d`
-for a new published build, or `compose.dev.yaml` with `--build` for local
-edits. `public/` and `private/` are mounted and need no rebuild.
+### 3. Prepare the ISO
 
-The server runs as whoever owns `private/`, so generated files need no `sudo`.
-A root-owned `private/` falls back to UID 10001 and warns.
-
----
-
-## On the Proxmox host
+On the same machine:
 
 ```bash
 mkdir -p /opt/iso-builder && cd /opt/iso-builder
 wget https://enterprise.proxmox.com/iso/proxmox-ve_9.2-1.iso
-
-apt update
-apt install -y proxmox-auto-install-assistant
 
 proxmox-auto-install-assistant prepare-iso proxmox-ve_9.2-1.iso \
     --fetch-from http \
@@ -137,6 +151,14 @@ a machine. If one leaks, regenerate `private/token`, restart, rebuild the ISOs.
 
 ## Reference
 
+### Notes
+
+- `server.py` lives in the image, so `docker compose pull && docker compose up -d`
+  for a published build, or `compose.dev.yaml` with `--build` for local edits.
+  `public/` and `private/` are mounted and need no rebuild.
+- The server runs as whoever owns `private/`, so generated files need no `sudo`.
+  A root-owned `private/` falls back to UID 10001 and warns.
+
 ### Endpoints
 
 | Method | Path | Response |
@@ -146,15 +168,13 @@ a machine. If one leaks, regenerate `private/token`, restart, rebuild the ISOs.
 | `GET` | `/answer` | `405` — a POST is expected |
 | `GET` | `/` | status page in debug mode, otherwise `404` |
 
-`POST /answer` sets `X-Answer-Match` to the answer file that matched, or `none`
-when it fell back to `public/default.toml`. A no-match also logs a `WARNING`
-naming the MACs.
+`POST /answer` sets `X-Answer-Match` to the file that matched, or `none` on
+fallback, and a no-match logs a `WARNING` naming the MACs.
 
 ### Debug mode
 
-`GET /` shows whether TLS and auth are on and which MACs have answer files —
-never file contents. **Off by default**, since that list reveals which machines
-you are provisioning. Uncomment `PVE_ANSWER_DEBUG=1` in
+`GET /` shows whether TLS and auth are on and which MACs have answer files,
+never file contents. **Off by default** — uncomment `PVE_ANSWER_DEBUG=1` in
 [`compose.yaml`](compose.yaml).
 
 ### Flags

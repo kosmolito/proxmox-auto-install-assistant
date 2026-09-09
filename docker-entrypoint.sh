@@ -1,15 +1,11 @@
 #!/bin/sh
 #
-# Generate anything the server needs but does not have yet, then hand over to
-# the server as an unprivileged user.
-#
-# Nothing here overwrites an existing file, so a container restart never
-# invalidates a certificate or token you are already using.
+# Creates whatever is missing, then runs the server unprivileged.
+# Existing files are never overwritten.
 
 set -eu
 
-# Fallback identity, baked into the image. The real one is derived from the
-# mounted directory below.
+# Used only if the private directory's owner cannot be used.
 FALLBACK_UID=10001
 FALLBACK_GID=10001
 
@@ -25,8 +21,7 @@ KEY_FILE="$TLS_DIR/server.key"
 
 log() { echo "entrypoint: $*"; }
 
-# Checked before anything is created, so a run that cannot succeed leaves no
-# half-written state behind.
+# Checked first, so a doomed run leaves nothing behind.
 if [ ! -e "$CERT_FILE" ] || [ ! -e "$KEY_FILE" ]; then
     if [ -z "${PVE_ANSWER_HOSTNAMES:-}" ]; then
         log "ERROR: no certificate at $CERT_FILE and PVE_ANSWER_HOSTNAMES is"
@@ -43,11 +38,8 @@ fi
 mkdir -p "$ANSWERS_DIR" "$TLS_DIR"
 
 # --- runtime identity ------------------------------------------------------
-#
-# Run as whoever owns the mounted private directory, so files generated here
-# belong to that user on the host and can be read, edited and deleted without
-# sudo. Falling back to the image's own user would leave root-owned files on a
-# Linux host.
+# Run as the owner of the private directory, so generated files are usable on
+# the host without sudo.
 
 DIR_UID="$(stat -c '%u' "$PRIVATE_DIR" 2>/dev/null || true)"
 DIR_GID="$(stat -c '%g' "$PRIVATE_DIR" 2>/dev/null || true)"
@@ -112,7 +104,6 @@ fi
 # --- TLS certificate -------------------------------------------------------
 
 if [ ! -e "$CERT_FILE" ] || [ ! -e "$KEY_FILE" ]; then
-    # Classify each entry as an IP or a DNS name for the SAN list.
     san=""
     IFS=','
     for host in $PVE_ANSWER_HOSTNAMES; do
@@ -150,16 +141,14 @@ if [ ! -e "$CERT_FILE" ] || [ ! -e "$KEY_FILE" ]; then
     chmod 644 "$CERT_FILE"
 fi
 
-# The fingerprint is printed on every start, not only when the certificate is
-# generated, so it is always available in the container log.
+# Printed every start, so it is always in the log.
 log "certificate SHA-256 fingerprint (pass to prepare-iso --cert-fingerprint):"
 log "  $(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 \
     | cut -d '=' -f 2)"
 
 # --- hand over -------------------------------------------------------------
 
-# Only the files this script is responsible for; answer files keep whatever
-# ownership the operator gave them.
+# Only files this script created; answer files keep their own ownership.
 chown "$APP_UID:$APP_GID" "$TOKEN_FILE" "$CERT_FILE" "$KEY_FILE" 2>/dev/null || true
 [ -e "$DEFAULT_ANSWER" ] && chown "$APP_UID:$APP_GID" "$DEFAULT_ANSWER" 2>/dev/null || true
 
