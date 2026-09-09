@@ -20,7 +20,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  # ---------------------------------------------------------------------------
+  unit-tests:
     name: Unit tests
     runs-on: ubuntu-latest
     steps:
@@ -41,51 +42,30 @@ jobs:
           docker compose -f compose.yaml config -q
           docker compose -f compose.dev.yaml config -q
 
+  # ---------------------------------------------------------------------------
   build:
-    name: Build, smoke test and publish
+    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    needs: test
+    needs: unit-tests
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
     steps:
       - uses: actions/checkout@v5
 
-      # Lets this amd64 runner build and run arm64 images.
+      # Needed to run the arm64 image on this amd64 runner.
       - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
 
-      # Multi-platform builds cannot be loaded into the docker daemon, so each
-      # architecture is built singly and smoke tested before the combined push.
-      - name: Build amd64 image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          load: true
-          tags: pve-answer:ci-amd64
-          cache-from: type=gha,scope=amd64
-          cache-to: type=gha,mode=max,scope=amd64
-
-      - name: Smoke test amd64
-        run: tests/smoke.sh pve-answer:ci-amd64
-
-      - name: Build arm64 image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/arm64
-          load: true
-          tags: pve-answer:ci-arm64
-          cache-from: type=gha,scope=arm64
-          cache-to: type=gha,mode=max,scope=arm64
-
-      - name: Smoke test arm64 (emulated)
-        run: tests/smoke.sh pve-answer:ci-arm64
-
-      # Everything below publishes, and is skipped for pull requests: a fork PR
-      # has no package write access, and unreviewed code should not be pushed.
       - name: Log in to ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -94,26 +74,162 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Derive image tags
+      # Pushed by digest only: no tag, so nothing points at this image until
+      # it has passed the smoke tests and the publish job promotes it.
+      - name: Build and push by digest
         if: github.event_name != 'pull_request'
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=sha,format=short
-
-      - name: Push multi-architecture image
-        if: github.event_name != 'pull_request'
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # Both architectures are already cached by the build steps above.
-          cache-from: |
-            type=gha,scope=amd64
-            type=gha,scope=arm64
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          # Without this, the recorded digest is an index wrapping the image
+          # and its attestations, so it would not match the manifest entry the
+          # publish job verifies against.
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Record digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digest
+          echo "${{ steps.build.outputs.digest }}" > /tmp/digest/${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digest/${{ matrix.arch }}
+          retention-days: 1
+          if-no-files-found: error
+
+      # A pull request cannot push (a fork's token has no package write access),
+      # so it builds locally and smoke tests here instead.
+      - name: Build locally (pull request)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: pve-answer:pr-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Smoke test (pull request)
+        if: github.event_name == 'pull_request'
+        run: tests/smoke.sh pve-answer:pr-${{ matrix.arch }}
+
+  # ---------------------------------------------------------------------------
+  smoke-test:
+    name: Smoke test ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+
+      # The arm64 image runs under emulation on this amd64 runner.
+      - uses: docker/setup-qemu-action@v3
+
+      - name: Log in to ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digest
+
+      # Tests the exact bytes that were pushed, addressed by digest.
+      - name: Pull and smoke test the built image
+        run: |
+          digest="$(cat /tmp/digest/${{ matrix.arch }})"
+          image="${REGISTRY}/${IMAGE_NAME}@${digest}"
+
+          echo "Testing $image"
+
+          # Without --platform, docker pulls the runner's own architecture and
+          # a cross-architecture digest fails to resolve.
+          docker pull -q --platform "linux/${{ matrix.arch }}" "$image"
+
+          tests/smoke.sh "$image"
+
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish manifest
+    runs-on: ubuntu-latest
+    needs: smoke-test
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: /tmp/digest
+
+      # No rebuild: this only writes a manifest list referencing the digests
+      # that the smoke tests just passed against.
+      - name: Create the multi-platform manifest
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}"
+          refs=""
+
+          for arch in amd64 arm64; do
+              digest="$(cat "/tmp/digest/$arch")"
+              echo "$arch -> $digest"
+              refs="$refs ${image}@${digest}"
+          done
+
+          # shellcheck disable=SC2086
+          docker buildx imagetools create \
+              --tag "${image}:latest" \
+              --tag "${image}:sha-${GITHUB_SHA:0:7}" \
+              $refs
+
+      - name: Verify the manifest points at the smoke-tested images
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}"
+          raw="$(docker buildx imagetools inspect --raw "${image}:latest")"
+
+          for arch in amd64 arm64; do
+              tested="$(cat "/tmp/digest/$arch")"
+              found="$(echo "$raw" | jq -r --arg a "$arch" \
+                  '.manifests[] | select(.platform.architecture == $a) | .digest')"
+
+              if [ "$found" != "$tested" ]; then
+                  echo "::error::$arch published as $found, expected $tested"
+                  exit 1
+              fi
+
+              echo "$arch: $found (the image that passed smoke testing)"
+          done
+
+      - name: Show what was published
+        run: |
+          docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:latest"
