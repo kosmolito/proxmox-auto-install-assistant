@@ -1,31 +1,20 @@
 #!/usr/bin/env bash
 #
-# Start the built image and assert the HTTP behaviour a Proxmox installer
-# depends on, in two scenarios:
-#
-#   1. pre-provisioned  - certificate, token and answer files already on disk
-#   2. first run        - an empty directory, everything generated on start
-#
-# Usage:
-#
-#   tests/smoke.sh [image-tag]      (default: pve-answer:smoke)
-#
-# Build it first, e.g.:
+# Asserts the HTTP behaviour a Proxmox installer depends on.
 #
 #   docker build -t pve-answer:smoke .
+#   tests/smoke.sh [image-tag]
 
 set -euo pipefail
 
 IMAGE="${1:-pve-answer:smoke}"
-# 0 lets Docker pick a free port, so the test cannot collide with whatever
-# else is listening. Override with PORT=... to pin it.
+# 0 lets Docker pick a free port. Override with PORT=... to pin it.
 PUBLISH_PORT="${PORT:-0}"
 CONTAINER="pve-answer-smoke-$$"
 WORKDIR="$(mktemp -d)"
 FAILURES=0
 
-# The entrypoint creates files as root, which the host user may not be able to
-# remove; delete them from inside a container instead.
+# Files may be owned by another uid, so remove them from inside a container.
 cleanup() {
     docker rm -f "$CONTAINER" "${CONTAINER}-nohost" "${CONTAINER}-root" \
         "${CONTAINER}-user" >/dev/null 2>&1 || true
@@ -48,18 +37,15 @@ check() {
     fi
 }
 
-# The image's own architecture, so a cross-architecture image starts under
-# emulation without a platform-mismatch warning.
+# Set explicitly, so a cross-architecture image starts without a warning.
 IMAGE_PLATFORM="$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')"
 
-# Wait for a container to answer on its published port, and echo that base URL.
-# Never use a fixed sleep here: under QEMU emulation the first start has to
-# generate a 4096-bit RSA key, which takes far longer than on native hardware.
+# Wait for a container to serve, and echo its base URL. Never a fixed sleep:
+# under emulation the first start generates a 4096-bit key and is slow.
 wait_ready() {
     local container="$1" port base
 
-    # The port mapping is not always registered by the time `docker run -d`
-    # returns, so poll for it rather than reading it once.
+    # The mapping is not always registered when `docker run -d` returns.
     for _ in $(seq 1 60); do
         port="$(docker port "$container" 8443/tcp 2>/dev/null | head -1 | sed 's/.*://')"
 
@@ -89,8 +75,7 @@ wait_ready() {
     return 1
 }
 
-# Start the image against $WORKDIR and wait for it to serve. Extra arguments
-# are passed to docker run.
+# Start the image against $WORKDIR. Extra arguments go to docker run.
 start_container() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
@@ -114,9 +99,7 @@ start_container() {
 
 status() { curl -sk -o /dev/null -w '%{http_code}' "$@"; }
 
-# `docker logs | grep -q` is unsafe here: grep exits on the first match, docker
-# logs dies of SIGPIPE, and `set -o pipefail` reports the pipeline as failed.
-# Match against a captured string instead.
+# `docker logs | grep -q` would SIGPIPE docker logs and trip pipefail.
 logs_contain() {
     local container="$1" needle="$2" logs
     logs="$(docker logs "$container" 2>&1)"
@@ -134,9 +117,7 @@ header() {
 KNOWN='{"network_interfaces":[{"mac":"bc:24:11:7b:51:aa"}]}'
 UNKNOWN='{"network_interfaces":[{"mac":"00:11:22:33:44:55"}]}'
 
-# ===========================================================================
 # Scenario 1: everything already provisioned
-# ===========================================================================
 
 echo "== pre-provisioned =="
 
@@ -224,9 +205,7 @@ check "runs as the private dir owner, or falls back when it is root" "yes" \
         || { [ "$DIR_OWNER" = "0" ] && [ "$RUNTIME_UID" = "10001" ]; } \
         && echo yes || echo no)"
 
-# ===========================================================================
 # Scenario 2: first run against an empty directory
-# ===========================================================================
 
 echo
 echo "== first run, empty directory =="
@@ -237,7 +216,7 @@ docker run --rm --platform "$IMAGE_PLATFORM" --entrypoint sh \
     -c 'rm -rf /w/public /w/private' >/dev/null 2>&1 || true
 mkdir -p "$WORKDIR/public" "$WORKDIR/private"
 
-# Without an address for the certificate's SAN it must refuse to start.
+# Must refuse to start with no address for the certificate's SAN.
 docker run --name "${CONTAINER}-nohost" --platform "$IMAGE_PLATFORM" \
     -e PVE_ANSWER_TOKEN_FILE=/app/private/token \
     -v "$WORKDIR/public:/app/public" -v "$WORKDIR/private:/app/private" \
@@ -268,7 +247,6 @@ check "created the answers directory" "yes" \
 
 check "logged the token for prepare-iso" "yes" \
     "$(logs_contain "$CONTAINER" '--answer-auth-token')"
-# grep -c reads all input, so it is safe under pipefail.
 check "logged the certificate fingerprint" "yes" \
     "$([ "$(docker logs "$CONTAINER" 2>&1 \
         | grep -cE '^entrypoint:   ([0-9A-F]{2}:){31}' || true)" != "0" ] \
@@ -305,8 +283,7 @@ check "generated default installs nothing" "yes" \
 LOG_LINES_BEFORE_RESTART="$(docker logs "$CONTAINER" 2>&1 | wc -l | tr -d ' ')"
 docker restart "$CONTAINER" >/dev/null
 
-# An ephemeral published port is reassigned on restart, so the old $BASE is
-# dead and polling it just burns the whole timeout.
+# An ephemeral port is reassigned on restart.
 PORT="$(docker port "$CONTAINER" 8443/tcp | head -1 | sed 's/.*://')"
 BASE="https://127.0.0.1:$PORT"
 
@@ -324,17 +301,14 @@ check "restart regenerates nothing" "0" \
         | tail -n "+$((LOG_LINES_BEFORE_RESTART + 1))" \
         | grep -cE 'generating a self-signed|generated a new auth token' || true)"
 
-# ===========================================================================
 # Scenario 3: root-owned private directory falls back to the image user
-# ===========================================================================
 
 echo
 echo "== root-owned private directory =="
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
-# A fresh named volume is owned by root, which is exactly the case that has to
-# fall back rather than run the server as root.
+# A fresh named volume is root-owned: the case that must fall back.
 ROOT_VOLUME="pve-answer-smoke-root-$$"
 docker volume create "$ROOT_VOLUME" >/dev/null
 
@@ -356,13 +330,9 @@ check "and serves" 200 "$(status "$ROOT_BASE/health")"
 
 docker rm -f "${CONTAINER}-root" >/dev/null 2>&1 || true
 
-# ===========================================================================
 # Scenario 4: private directory owned by a real user
-# ===========================================================================
-#
-# Docker Desktop presents bind mounts as root-owned whatever the host says, so
-# the derivation is exercised through a volume chowned to a known uid instead.
-# This is the case that matters on a Linux host.
+# Docker Desktop reports bind mounts as root-owned, so a chowned volume is used
+# to exercise the derivation that matters on Linux.
 
 echo
 echo "== private directory owned by uid 4242 =="
@@ -397,7 +367,6 @@ check "and still serves" 200 "$(status "$USER_BASE/health")"
 docker rm -f "${CONTAINER}-user" >/dev/null 2>&1 || true
 docker volume rm "$ROOT_VOLUME" >/dev/null 2>&1 || true
 
-# ===========================================================================
 
 echo
 if [ "$FAILURES" -gt 0 ]; then
