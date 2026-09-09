@@ -27,8 +27,11 @@ FAILURES=0
 # The entrypoint creates files as root, which the host user may not be able to
 # remove; delete them from inside a container instead.
 cleanup() {
-    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-    docker run --rm --entrypoint sh -v "$WORKDIR:/w" "$IMAGE" \
+    docker rm -f "$CONTAINER" "${CONTAINER}-nohost" "${CONTAINER}-root" \
+        "${CONTAINER}-user" >/dev/null 2>&1 || true
+    docker volume rm "pve-answer-smoke-root-$$" >/dev/null 2>&1 || true
+    docker run --rm --platform "$IMAGE_PLATFORM" --entrypoint sh \
+        -v "$WORKDIR:/w" "$IMAGE" \
         -c 'rm -rf /w/public /w/private' >/dev/null 2>&1 || true
     rm -rf "$WORKDIR" 2>/dev/null || true
 }
@@ -45,17 +48,53 @@ check() {
     fi
 }
 
+# The image's own architecture, so a cross-architecture image starts under
+# emulation without a platform-mismatch warning.
+IMAGE_PLATFORM="$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')"
+
+# Wait for a container to answer on its published port, and echo that base URL.
+# Never use a fixed sleep here: under QEMU emulation the first start has to
+# generate a 4096-bit RSA key, which takes far longer than on native hardware.
+wait_ready() {
+    local container="$1" port base
+
+    # The port mapping is not always registered by the time `docker run -d`
+    # returns, so poll for it rather than reading it once.
+    for _ in $(seq 1 60); do
+        port="$(docker port "$container" 8443/tcp 2>/dev/null | head -1 | sed 's/.*://')"
+
+        [ -n "$port" ] && break
+
+        sleep 0.5
+    done
+
+    if [ -z "$port" ]; then
+        echo "no published port for $container" >&2
+        docker logs "$container" >&2
+        return 1
+    fi
+
+    base="https://127.0.0.1:$port"
+
+    for _ in $(seq 1 240); do
+        if curl -sk -o /dev/null "$base/health"; then
+            echo "$base"
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    echo "$container never became ready. Container log:" >&2
+    docker logs "$container" >&2
+    return 1
+}
+
 # Start the image against $WORKDIR and wait for it to serve. Extra arguments
 # are passed to docker run.
 start_container() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
-    # Run the image's own architecture explicitly, so a cross-architecture
-    # image starts under emulation without a platform-mismatch warning.
-    local platform
-    platform="$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')"
-
-    docker run -d --name "$CONTAINER" --platform "$platform" \
+    docker run -d --name "$CONTAINER" --platform "$IMAGE_PLATFORM" \
         -p "$PUBLISH_PORT:8443" \
         -e PVE_ANSWER_TOKEN_FILE=/app/private/token \
         -v "$WORKDIR/public:/app/public" \
@@ -70,20 +109,7 @@ start_container() {
         exit 1
     fi
 
-    BASE="https://127.0.0.1:$PORT"
-
-    # Generous, because an emulated (cross-architecture) container starts
-    # slowly, and the first run also has to generate an RSA key.
-    for _ in $(seq 1 180); do
-        if curl -sk -o /dev/null "$BASE/health"; then
-            return 0
-        fi
-        sleep 0.5
-    done
-
-    echo "FAIL server never became ready. Container log:" >&2
-    docker logs "$CONTAINER" >&2
-    exit 1
+    BASE="$(wait_ready "$CONTAINER")" || exit 1
 }
 
 status() { curl -sk -o /dev/null -w '%{http_code}' "$@"; }
@@ -206,12 +232,13 @@ echo
 echo "== first run, empty directory =="
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-docker run --rm --entrypoint sh -v "$WORKDIR:/w" "$IMAGE" \
+docker run --rm --platform "$IMAGE_PLATFORM" --entrypoint sh \
+    -v "$WORKDIR:/w" "$IMAGE" \
     -c 'rm -rf /w/public /w/private' >/dev/null 2>&1 || true
 mkdir -p "$WORKDIR/public" "$WORKDIR/private"
 
 # Without an address for the certificate's SAN it must refuse to start.
-docker run --name "${CONTAINER}-nohost" \
+docker run --name "${CONTAINER}-nohost" --platform "$IMAGE_PLATFORM" \
     -e PVE_ANSWER_TOKEN_FILE=/app/private/token \
     -v "$WORKDIR/public:/app/public" -v "$WORKDIR/private:/app/private" \
     "$IMAGE" >/dev/null 2>&1 || true
@@ -311,20 +338,21 @@ docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 ROOT_VOLUME="pve-answer-smoke-root-$$"
 docker volume create "$ROOT_VOLUME" >/dev/null
 
-docker run -d --name "${CONTAINER}-root" -p 0:8443 \
+docker run -d --name "${CONTAINER}-root" --platform "$IMAGE_PLATFORM" -p 0:8443 \
     -e PVE_ANSWER_HOSTNAMES=127.0.0.1 \
     -e PVE_ANSWER_TOKEN_FILE=/app/private/token \
     -v "$WORKDIR/public:/app/public" \
     -v "$ROOT_VOLUME:/app/private" \
     "$IMAGE" >/dev/null
 
-sleep 5
+ROOT_BASE="$(wait_ready "${CONTAINER}-root")" || exit 1
 
 check "warns about the root-owned directory" "yes" \
     "$(logs_contain "${CONTAINER}-root" 'owned by root')"
 check "falls back to the image user, not root" "10001" \
     "$(docker exec "${CONTAINER}-root" awk '/^Uid:/ {print $2}' /proc/1/status 2>/dev/null \
         || echo unavailable)"
+check "and serves" 200 "$(status "$ROOT_BASE/health")"
 
 docker rm -f "${CONTAINER}-root" >/dev/null 2>&1 || true
 
@@ -339,17 +367,18 @@ docker rm -f "${CONTAINER}-root" >/dev/null 2>&1 || true
 echo
 echo "== private directory owned by uid 4242 =="
 
-docker run --rm --entrypoint sh -v "$ROOT_VOLUME:/app/private" "$IMAGE" \
+docker run --rm --platform "$IMAGE_PLATFORM" --entrypoint sh \
+    -v "$ROOT_VOLUME:/app/private" "$IMAGE" \
     -c 'chown 4242:4242 /app/private' >/dev/null
 
-docker run -d --name "${CONTAINER}-user" -p 0:8443 \
+docker run -d --name "${CONTAINER}-user" --platform "$IMAGE_PLATFORM" -p 0:8443 \
     -e PVE_ANSWER_HOSTNAMES=127.0.0.1 \
     -e PVE_ANSWER_TOKEN_FILE=/app/private/token \
     -v "$WORKDIR/public:/app/public" \
     -v "$ROOT_VOLUME:/app/private" \
     "$IMAGE" >/dev/null
 
-sleep 5
+USER_BASE="$(wait_ready "${CONTAINER}-user")" || exit 1
 
 check "runs as the directory owner" "4242" \
     "$(docker exec "${CONTAINER}-user" awk '/^Uid:/ {print $2}' /proc/1/status \
@@ -363,9 +392,7 @@ check "generated key owned by that uid" "4242" \
     "$(docker exec "${CONTAINER}-user" stat -c '%u' /app/private/tls/server.key \
         2>/dev/null || echo unavailable)"
 
-USER_PORT="$(docker port "${CONTAINER}-user" 8443/tcp | head -1 | sed 's/.*://')"
-check "and still serves" 200 \
-    "$(status "https://127.0.0.1:$USER_PORT/health")"
+check "and still serves" 200 "$(status "$USER_BASE/health")"
 
 docker rm -f "${CONTAINER}-user" >/dev/null 2>&1 || true
 docker volume rm "$ROOT_VOLUME" >/dev/null 2>&1 || true
