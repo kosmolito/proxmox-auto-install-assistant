@@ -132,11 +132,6 @@
       retries: 60
       delay: 2
 
-    - name: Read the auth token
-      ansible.builtin.slurp:
-        src: "{{ pve_answer_dir }}/private/token"
-      register: answer_token
-
     - name: Read the certificate fingerprint
       ansible.builtin.command:
         cmd: >-
@@ -149,5 +144,5 @@
       ansible.builtin.debug:
         msg:
           - "URL:         {{ pve_answer_url }}"
-          - "Token:       {{ answer_token.content | b64decode }}"
+          - "Token:       can be read from {{ pve_answer_dir }}/private/token"
           - "Fingerprint: {{ answer_fingerprint.stdout.split('=')[1] }}"

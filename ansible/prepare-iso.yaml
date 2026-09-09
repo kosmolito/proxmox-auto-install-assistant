@@ -53,6 +53,7 @@
         src: "{{ pve_answer_dir }}/private/token"
       register: answer_token
       when: answer_creds_present | bool
+      no_log: true
 
     - name: Read the certificate fingerprint
       ansible.builtin.command:
