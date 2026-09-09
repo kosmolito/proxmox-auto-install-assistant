@@ -10,7 +10,17 @@ The installer POSTs its hardware info to `/answer`. The server returns
 `public/answers/<mac>.toml` for a matching NIC, or `public/default.toml` if
 none matches.
 
-Two directories on the answer server, the same either way you set it up:
+The answer server must run **Debian or Ubuntu** — setup uses `apt`, and
+`proxmox-auto-install-assistant` is published as a `.deb`.
+
+Two ways to set it up, with the same result:
+
+- **Ansible** — from your workstation against the answer server over SSH, or on
+  the answer server itself with Ansible installed and `ansible_connection=local`
+  in the inventory.
+- **Manual** — the commands below, run on the answer server.
+
+Two directories on the answer server, the same either way:
 
 | Path | |
 | --- | --- |
@@ -26,8 +36,7 @@ git clone https://github.com/kosmolito/proxmox-auto-install-assistant.git
 cd proxmox-auto-install-assistant/ansible
 
 cp hosts.example hosts
-$EDITOR hosts                        # the answer server's address and user
-$EDITOR group_vars/answer_server.yml # ISO URL, ports, paths
+# Update `hosts` and `group_vars/answer_server.yml` with your values:
 
 ansible-playbook site.yaml
 ```
