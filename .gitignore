@@ -5,3 +5,4 @@ __pycache__/
 .remember/
 *testing*
 *.log
+.ansible/
