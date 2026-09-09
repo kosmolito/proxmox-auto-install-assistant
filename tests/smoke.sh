@@ -277,10 +277,18 @@ check "generated default installs nothing" "yes" \
 # A restart must not invalidate what the first run generated.
 LOG_LINES_BEFORE_RESTART="$(docker logs "$CONTAINER" 2>&1 | wc -l | tr -d ' ')"
 docker restart "$CONTAINER" >/dev/null
+
+# An ephemeral published port is reassigned on restart, so the old $BASE is
+# dead and polling it just burns the whole timeout.
+PORT="$(docker port "$CONTAINER" 8443/tcp | head -1 | sed 's/.*://')"
+BASE="https://127.0.0.1:$PORT"
+
 for _ in $(seq 1 180); do
     curl -sk -o /dev/null "$BASE/health" && break
     sleep 0.5
 done
+
+check "serves again after restart" 200 "$(status "$BASE/health")"
 
 check "restart keeps the same token" "$GENERATED_TOKEN" \
     "$(docker exec "$CONTAINER" cat /app/private/token)"
