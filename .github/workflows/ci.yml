@@ -3,11 +3,18 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'ansible/**'
+      - '**.md'
+      - '.gitignore'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'ansible/**'
+      - '**.md'
+      - '.gitignore'
   schedule:
-    # Weekly, Mondays 04:00 UTC. Rebuilds on a fresh python:3.13-slim so base
-    # image security updates land without a code change.
+    # Weekly, for base image updates.
     - cron: "0 4 * * 1"
   workflow_dispatch:
 
@@ -61,7 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Needed to run the arm64 image on this amd64 runner.
+      # To build arm64 on this amd64 runner.
       - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
@@ -74,8 +81,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Pushed by digest only: no tag, so nothing points at this image until
-      # it has passed the smoke tests and the publish job promotes it.
+      # By digest only: untagged until the smoke tests pass and publish promotes it.
       - name: Build and push by digest
         if: github.event_name != 'pull_request'
         id: build
@@ -85,9 +91,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
-          # Without this, the recorded digest is an index wrapping the image
-          # and its attestations, so it would not match the manifest entry the
-          # publish job verifies against.
+          # Otherwise the digest is an index wrapping the image plus attestations.
           provenance: false
           sbom: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
@@ -106,8 +110,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      # A pull request cannot push (a fork's token has no package write access),
-      # so it builds locally and smoke tests here instead.
+      # Fork tokens cannot push, so PRs build and test locally.
       - name: Build locally (pull request)
         if: github.event_name == 'pull_request'
         uses: docker/build-push-action@v6
@@ -139,7 +142,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The arm64 image runs under emulation on this amd64 runner.
       - uses: docker/setup-qemu-action@v3
 
       - name: Log in to ${{ env.REGISTRY }}
@@ -154,7 +156,6 @@ jobs:
           name: digest-${{ matrix.arch }}
           path: /tmp/digest
 
-      # Tests the exact bytes that were pushed, addressed by digest.
       - name: Pull and smoke test the built image
         run: |
           digest="$(cat /tmp/digest/${{ matrix.arch }})"
@@ -162,8 +163,7 @@ jobs:
 
           echo "Testing $image"
 
-          # Without --platform, docker pulls the runner's own architecture and
-          # a cross-architecture digest fails to resolve.
+          # Without --platform, a cross-architecture digest fails to resolve.
           docker pull -q --platform "linux/${{ matrix.arch }}" "$image"
 
           tests/smoke.sh "$image"
@@ -193,8 +193,7 @@ jobs:
           merge-multiple: true
           path: /tmp/digest
 
-      # No rebuild: this only writes a manifest list referencing the digests
-      # that the smoke tests just passed against.
+      # No rebuild: just a manifest list over the tested digests.
       - name: Create the multi-platform manifest
         run: |
           image="${REGISTRY}/${IMAGE_NAME}"
